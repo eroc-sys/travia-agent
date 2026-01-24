@@ -28,8 +28,8 @@ An intelligent travel assistant powered by **LangGraph**, **Ollama (local LLM)**
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/yourusername/agentic-travel-assistant.git
-cd agentic-travel-assistant
+git clone https://github.com/eroc-sys/travia-agent.git
+cd travia-agent 
 ```
 
 ### 2. Create a virtual environment
@@ -51,9 +51,6 @@ ollama pull llama3.2:3b
 ```
 
 ### 5. Configure environment variables
-```bash
-
-```
 
 create `.env` in root directory and add your credentials:
 
