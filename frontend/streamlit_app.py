@@ -124,8 +124,10 @@ with st.sidebar:
     
     examples = [
         "Book a flight from BOM to DEL tomorrow",
-        "Find hotels in bombay for 3 nights",
-        "I need a flight from bombay to delhi next week and a hotel for 2 nights",
+        "Book a flight from bombay to delhi for 28th january 2026",
+        "Find Hotels in Bombay for 3 days from 27th jan",
+        "i need a flight from bombay to delhi for tomorrow and a hotel for 2 nights",
+        
     ]
     
     for example in examples:
