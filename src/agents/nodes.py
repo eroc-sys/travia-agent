@@ -10,6 +10,7 @@ from src.services.llm_service import llm_service
 from src.services.amadeus_service import amadeus_service
 from src.utils.cache import airport_cache
 from src.config.settings import EUR_TO_INR
+from src.utils.airport_code_validator import get_airport_validator
 
 
 def intent_node(state: AgentState):
@@ -51,7 +52,8 @@ Use intent=follow_up if the user is asking about previous results or making modi
 
 4. If user query is incomplete or ambiguous, use intent=clarify and explain what's missing in reasoning.
 
-5. Common airport codes: Mumbai=BOM, Delhi=DEL, Bangalore=BLR, Chennai=MAA, Kolkata=CCU
+5. Extract city/airport names as they appear - DO NOT convert to IATA codes yourself.
+   Examples: "Mumbai", "Bombay", "BOM" all acceptable - validation happens later.
 
 Current Query: {state.query}
 """
@@ -61,6 +63,51 @@ Current Query: {state.query}
         intent_data = raw 
     else:
         intent_data = cast(TravelIntent, raw).model_dump()
+    
+    # =========================================
+    # AIRPORT CODE VALIDATION & CORRECTION
+    # =========================================
+    
+    # Get validator instance
+    validator = get_airport_validator()
+    
+    original_intent = intent_data.get("intent")
+    
+    # Validate and correct airport codes for flight searches
+    if original_intent in ["flight_search", "both"]:
+        origin_input = intent_data.get("origin")
+        dest_input = intent_data.get("destination")
+        
+        if origin_input or dest_input:
+            validation_result = validator.validate_and_fix_iata(origin_input, dest_input)
+            
+            # Update with corrected codes
+            if validation_result["origin"]:
+                intent_data["origin"] = validation_result["origin"]
+            
+            if validation_result["destination"]:
+                intent_data["destination"] = validation_result["destination"]
+            
+            # Check if validation failed
+            if original_intent == "flight_search":
+                if not validation_result["origin_valid"]:
+                    intent_data["intent"] = "clarify"
+                    intent_data["reasoning"] = f"Could not find airport code for departure city: '{origin_input}'"
+                elif not validation_result["destination_valid"]:
+                    intent_data["intent"] = "clarify"
+                    intent_data["reasoning"] = f"Could not find airport code for arrival city: '{dest_input}'"
+    
+    # Validate hotel destination
+    if original_intent in ["hotel_search", "both"]:
+        dest_input = intent_data.get("destination")
+        if dest_input:
+            # For hotels, we validate the city exists
+            iata = validator.get_iata_code(dest_input)
+            if iata:
+                intent_data["destination"] = iata
+            else:
+                intent_data["intent"] = "clarify"
+                intent_data["reasoning"] = f"Could not find airport/city code for: '{dest_input}'"
     
     # =========================================
     # POST-PROCESSING VALIDATION (CRITICAL!)
@@ -220,8 +267,9 @@ def flight_tool(state: AgentState):
                     print("⚠️ API appears to be down (Error 141), using web search fallback...")
                     
                     # Get city names for better search
-                    origin_city = airport_cache.get_city_name(i["origin"]) if i.get("origin") else i["origin"]
-                    dest_city = airport_cache.get_city_name(i["destination"]) if i.get("destination") else i["destination"]
+                    validator = get_airport_validator()
+                    origin_city = validator.get_city_name(i["origin"]) if i.get("origin") else i["origin"]
+                    dest_city = validator.get_city_name(i["destination"]) if i.get("destination") else i["destination"]
                     
                     # Format date nicely
                     try:
@@ -256,14 +304,15 @@ def flight_tool(state: AgentState):
 def get_fallback_message(state: AgentState):
     """Generic fallback message when web search also fails"""
     i = state.intent or {}
+    validator = get_airport_validator()
     
     try:
-        origin_city = airport_cache.get_city_name(i.get('origin', '')) if i.get('origin') else 'departure city'
+        origin_city = validator.get_city_name(i.get('origin', '')) if i.get('origin') else 'departure city'
     except Exception:
         origin_city = i.get('origin', 'departure city')
     
     try:
-        dest_city = airport_cache.get_city_name(i.get('destination', '')) if i.get('destination') else 'destination city'
+        dest_city = validator.get_city_name(i.get('destination', '')) if i.get('destination') else 'destination city'
     except Exception:
         dest_city = i.get('destination', 'destination city')
     
@@ -281,7 +330,7 @@ def get_fallback_message(state: AgentState):
 1. **Visit these sites directly:**
    - Google Flights: https://www.google.com/flights
    - Skyscanner: https://www.skyscanner.com
-   - Kayak: https://www.kayak.com
+   - Kayak: https://www.kayay.com
 
 2. **Check airline websites:**
    - Air India: https://www.airindia.in
@@ -617,32 +666,49 @@ def clarify_node(state: AgentState):
 
 def synthesis_node(state: AgentState):
     lines = []
+    validator = get_airport_validator()
     
     # Handle flights
     if state.flights:
         lines.append("✈️ **FLIGHTS:**")
         for f in state.flights[:5]:
-            segment = f["itineraries"][0]["segments"][0]
-            flight_code = f"{segment['carrierCode']} {segment['number']}"
+            # Get the ENTIRE itinerary, not just first segment
+            itinerary = f["itineraries"][0]
+            segments = itinerary["segments"]
             
-            dt = datetime.fromisoformat(segment["departure"]["at"])
+            # IMPORTANT: Show the full route (origin to final destination)
+            first_segment = segments[0]  # Departure info
+            last_segment = segments[-1]   # Arrival info (may be different if connecting flight)
+            
+            # Get carrier code and flight number from first segment
+            flight_code = f"{first_segment['carrierCode']} {first_segment['number']}"
+            
+            # Get departure time from first segment
+            dt = datetime.fromisoformat(first_segment["departure"]["at"])
             if dt.tzinfo is not None:
                 dt = dt.replace(tzinfo=None) 
             time_str = dt.strftime("%d %b %Y, %I:%M %p")
 
+            # Get price
             price_eur = float(f["price"]["total"])
             price_inr = int(price_eur * EUR_TO_INR)
 
-            dep_code = segment["departure"]["iataCode"]
-            arr_code = segment["arrival"]["iataCode"]
+            # CRITICAL FIX: Use first segment for origin, last segment for destination
+            dep_code = first_segment["departure"]["iataCode"]
+            arr_code = last_segment["arrival"]["iataCode"]  # Use LAST segment's arrival!
 
-            dep_city = airport_cache.get_city_name(dep_code)
-            arr_city = airport_cache.get_city_name(arr_code)
+            dep_city = validator.get_city_name(dep_code)
+            arr_city = validator.get_city_name(arr_code)
 
             route_str = f"{dep_city} ({dep_code}) → {arr_city} ({arr_code})"
+            
+            # Add connection info if applicable
+            connection_info = ""
+            if len(segments) > 1:
+                connection_info = f" ({len(segments)} stop{'s' if len(segments) > 2 else ''})"
 
             lines.append(
-                f"  {flight_code} | {route_str} | {time_str} | ₹{price_inr}"
+                f"  {flight_code}{connection_info} | {route_str} | {time_str} | ₹{price_inr}"
             )
         lines.append("")
     
